@@ -1,0 +1,32 @@
+Advanced Features & Tooling Strategy for C++ To-Do App
+======================================================
+
+1. Dependency Management (vcpkg in Manifest Mode)
+-------------------------------------------------
+Problem: Managing third-party C++ libraries manually causes linker errors and bloated repositories.
+Solution: Use Microsoft's vcpkg package manager in "Manifest Mode".
+* Implementation: Create a `vcpkg.json` file at the project root.
+* CMake Integration: CMake will automatically download, compile, and link dependencies on build.
+* Key Libraries:
+  - `nlohmann-json`: For serializing/deserializing tasks and boards.
+  - `cli11`: For parsing terminal flags and required arguments cleanly.
+  - `fmt`: For optimized and readable string formatting.
+
+2. Fuzzy Searching (Levenshtein Distance)
+-----------------------------------------
+Problem: Users make typos in the CLI (e.g., typing "srvver" instead of "server").
+Solution: Implement the Levenshtein Distance algorithm to calculate single-character edits.
+* The Threshold: Allow a maximum distance of 2 or 3 edits.
+* Execution: If an exact task ID or title match fails, run the input against all active task titles.
+* Resolution:
+  - If 1 close match is found: Assume it's a typo and execute the command.
+  - If multiple close matches are found: Block execution and prompt the user (e.g., "Did you mean A or B?").
+
+3. Rolling Backups & Data Safety
+--------------------------------
+Problem: JSON files can corrupt if power is lost during a write operation.
+Solution: A silent, automated rolling backup system.
+* Storage: Create a `.todo/backups/` directory.
+* Trigger: On backend execution, check if the newest backup is older than 24 hours.
+* Routine: Copy `tasks.json`, `boards.json`, and `userdata.json` into a timestamped archive (e.g., backup_YYYY-MM-DD.zip).
+* Rotation: Keep a maximum of 7 backups. Delete the oldest one when generating the 8th to save disk space.
