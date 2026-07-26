@@ -1,0 +1,11 @@
+{
+  "name": "powertree",
+  "version-string": "0.1.0",
+  "description": "PowerTree — a C++ CLI to-do application.",
+  "dependencies": [
+    "fmt",
+    "cli11",
+    "nlohmann-json",
+    "catch2"
+  ]
+}

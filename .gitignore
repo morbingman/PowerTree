@@ -1,5 +1,33 @@
-*.txt
-*.h
-README.md
+# Build output
+build/
+out/
+cmake-build-*/
+[Bb]uild/
+
+# vcpkg (manifest mode installs here; the vcpkg clone itself is not vendored)
+vcpkg_installed/
+
+# Compiled artifacts
+*.o
+*.obj
+*.exe
+*.pdb
+*.a
+*.so
+*.dylib
+
+# IDE / editor
+.vscode/
+.idea/
+.cache/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+#AI related
+CLAUDE.md
 HANDOFF.md
-*.docx

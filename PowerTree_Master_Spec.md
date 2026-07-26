@@ -2,7 +2,7 @@
 
 **C++ CLI To-Do Application**
 Consolidated Architectural, Functional & Data Specification
-Version 1.0 (Draft) · Consolidated 2026-07-25
+Version 1.0 (Draft) · Consolidated 2026-07-25 · Updated 2026-07-26
 
 ---
 
@@ -19,7 +19,7 @@ Version 1.0 (Draft) · Consolidated 2026-07-25
 - [8. Fuzzy Matching & Typo Tolerance](#8-fuzzy-matching--typo-tolerance)
 - [9. Validation Rules](#9-validation-rules)
 - [10. CLI Specification](#10-cli-specification)
-- [11. Deferred Sections (TBD)](#11-deferred-sections-tbd)
+- [11. Resolved Design Decisions](#11-resolved-design-decisions)
 - [12. Build & Dependency Toolchain](#12-build--dependency-toolchain)
 
 ---
@@ -41,7 +41,7 @@ Where the sources conflict, the SRS is authoritative, but useful ideas the SRS o
 
 > **Resolved conflicts:** Persistence is JSON only (CSV dropped). A 0–10 priority field is re-introduced. "Overdue" and "Recurring" become derived display states rather than persisted statuses.
 
-> **Open items:** Sections marked TBD (class/function design, lock-file mechanics, the settings system, and final exit-code numbers) are intentionally deferred and will be designed collaboratively.
+> **Resolved items:** The sections formerly marked TBD — class/function design (§11.1), the settings system (§11.2), lock-file mechanics (§11.3), and final exit codes (§11.4) — were designed collaboratively and are now locked. See §11 for the resolution summary; the full class/function design lives in `PowerTree_Class_Design.md` with code signatures in `PowerTree_Sketches.h`.
 
 ---
 
@@ -77,7 +77,7 @@ Data is persisted via standard JSON serialization inside a hidden `.todo` direct
 |---|---|
 | `.todo/tasks.json` | Array of Task objects. Highly volatile; frequent read/writes. |
 | `.todo/boards.json` | Array of Board objects; the structural ledger. |
-| `.todo/userdata.json` | Key-value global state (ActiveBoardID, DefaultBoardID, ThemePreferences, settings). |
+| `.todo/userdata.json` | Typed `UserData` settings struct — active/storage board, defaults, display prefs, upcoming defaults, and an `extra` map (§11.2). |
 | `.todo/journal.log` | Undo snapshot stack (§6.3). Capped at the last 20 operations. |
 | `.todo/backups/` | Disaster-recovery copies, timestamped (§7). |
 | `.todo/.lock` | Process lock file preventing concurrent writes (§6.4). |
@@ -86,6 +86,7 @@ Data is persisted via standard JSON serialization inside a hidden `.todo` direct
 
 - All files are UTF-8 encoded.
 - All DateTime fields use ISO 8601 strings (`YYYY-MM-DDTHH:MM:SSZ`) for cross-platform consistency.
+- Duration fields use ISO 8601 duration form (e.g. `PT1H`, `P1DT30M`); only days/hours/minutes/seconds are supported — months and years are rejected (use days, e.g. `P30D`).
 - Writes are atomic (temp file + fsync + rename); the live file is never observed half-written (§6.2).
 
 ---
@@ -103,11 +104,13 @@ All DateTime fields strictly adhere to ISO 8601. Primary keys are UUIDv4 strings
 | Description | String | Optional. Max 8,192 chars. Supports Markdown / subtask parsing symbols. |
 | Priority | Integer | 0–10. 0 = emergency, 10 = non-issue. Default 5. (Re-introduced from requirements.) |
 | Status | Enum | ToDo, InProgress, Pending, Done, Cancelled. (Overdue/Recurring are derived, not stored.) |
-| RecurrenceRule | String | None, Daily, Weekly, Monthly, Yearly (+ optional interval config). |
-| ParentID | String | UUID of parent. Empty string if root task. |
+| RecurrenceRule | String | None, Hourly, Daily, Weekly, Monthly, Yearly (+ optional interval config). |
+| ParentID | String | UUID of parent. Empty string if root task. Settable at add time and via `update --parent` (re-parenting — §4.7). |
 | ChildIDs | Array\<String\> | Direct subtask UUIDs. Max 50; subtree depth max 4. |
 | CreatedAt | DateTime | Creation timestamp (ISO 8601). Immutable. |
-| DueDate | DateTime | Optional deadline. Past dates blocked on manual entry. |
+| DueDate | DateTime | Optional deadline. Past dates blocked on manual entry. A time component makes the task "event-like" (the start); when Duration is set, DueDate must carry a time component. |
+| Duration | String (ISO 8601 duration) | Optional. e.g. `PT1H`. Presence makes the task event-like; the end time is computed as DueDate + Duration and is never stored. Days/hours/minutes/seconds only (no months/years). |
+| Reminders | Array\<Reminder\> | Optional. Each Reminder = `{ OffsetOrTime, Fired }` — OffsetOrTime is an ISO 8601 duration offset (e.g. `-PT30M`, relative to DueDate) or an absolute datetime; Fired is a boolean set once the reminder is surfaced. Empty = none. See §3.4. |
 | IsArchived | Boolean | True = hidden from default views. False by default. |
 | Tags | Array\<String\> | Max 25. Each 1–50 chars, lowercased, `[a-z0-9-_]`. |
 | BoardID | String | Foreign key into boards.json. |
@@ -128,6 +131,14 @@ These are computed at read/display time and never written to disk, avoiding need
 - **Overdue** — true when DueDate < now and Status is not Done/Cancelled.
 - **Recurring** — true when RecurrenceRule ≠ None.
 
+### 3.4 Events & reminders
+
+A "calendar" is not a separate store; it is a view/filter over tasks that carry datetimes. A task is **event-like** when its DueDate has a time component (the start) and/or a Duration is set (the end = DueDate + Duration). Event-like tasks reuse boards, tags, subtasks, recurrence, the state machine, and sorting for free.
+
+**Precision** is inferred from the ISO 8601 string: `2026-07-25` is date-only (overdue at end-of-day), `2026-07-25T15:00:00+07:00` is a datetime (overdue at the instant). No separate precision field is stored.
+
+**Reminders** work on any task. A reminder's fire time is either an absolute datetime or a duration offset relative to DueDate (e.g. `-PT30M` = 30 minutes before due). The fire time must be before DueDate and, at creation, in the future. The CLI never fires notifications itself; `todo due-reminders` (§10.5) is the command an external scheduler or the future GUI polls to surface due reminders and mark them consumed.
+
 ---
 
 ## 4. Lifecycle & State Machine Rules
@@ -140,7 +151,7 @@ Modifying fields (tags, description, etc.) overwrites existing data; it does not
 
 1. **Trigger** — user completes a task whose RecurrenceRule ≠ None.
 2. **Original mutation** — original Status → Done, IsArchived → True.
-3. **Clone generation** — new UUID (6-char prefix unique); copy Title, Description, Tags, Priority, BoardID, RecurrenceRule.
+3. **Clone generation** — new UUID (6-char prefix unique); copy Title, Description, Tags, Priority, BoardID, RecurrenceRule, Duration, and Reminders. Each cloned reminder's Fired flag resets to false.
 4. **Time shift** — compute new DueDate via the recurrence algorithm (§4.3).
 5. **Clone insertion** — Clone Status → ToDo; persist both atomically.
 
@@ -165,11 +176,23 @@ The derived Overdue condition restricts actions. Allowed: postpone (updates date
 
 ### 4.5 Hard delete (discard) restriction
 
-Discard permanently erases data. Checked at runtime: if Status ≠ Done AND Status ≠ Cancelled, reject with a validation error.
+Discard permanently erases data. Checked at runtime: discard is allowed only when IsArchived == true OR Status == Done OR Status == Cancelled; otherwise reject with a validation error. (Archive is an orthogonal flag, not a status — a task can be archived in any status.)
 
 ### 4.6 Reopen (state resurrection)
 
 `reopen <ID>` transitions a Done or Cancelled task back to ToDo. Everything else about the task — title, tags, due date, priority, board, subtasks — is left identical; only the status changes.
+
+### 4.7 Re-parenting
+
+A task's parent is set at creation (`-p ParentID`) and can be changed later with `todo update <ID> --parent <ID|"">`. Re-parenting is a **move**: the task's subtree moves with it (children stay attached), not a flatten.
+
+- **Root sentinel** — `--parent ""` (or any empty/absent value) means top-level/root.
+- **Cycle prevention** (checked in order): normalize empty → root (skip further checks if root); the new parent must not be the task itself; the new parent must exist; the new parent must not be one of the task's own descendants (an O(subtree) downward walk collects descendants). This prevents cycles at the source.
+- **Destination limits** — subtask depth ≤ 4 and ChildIDs ≤ 50 are still enforced on the destination after a move.
+
+### 4.8 Reminder recalculation on due-date edit
+
+When `todo update <ID> --due` changes the due date, every reminder that uses a duration offset has its fire time recomputed, and its Fired flag is reset to `false` **unconditionally**. If the new fire time is already in the past, the next `todo due-reminders` run fires it immediately — deciding that at edit time would be extra logic for no gain. Absolute-datetime reminders are unaffected by a due-date change.
 
 ---
 
@@ -189,9 +212,12 @@ If a child is discarded, locate its parent and remove the child's UUID from the 
 
 ### 5.4 Startup integrity routine (O(N))
 
-1. **Orphan check** — scan all tasks; if Task.BoardID is not found in boards.json, overwrite it with DefaultBoardID.
+Runs silently after hydration and auto-repairs structural inconsistencies. The repair destination is `storageBoardId` (a safety-net board distinct from the active board — §11.2).
+
+1. **Orphan check** — if Task.BoardID is not found in boards.json, overwrite it with storageBoardId.
 2. **Alignment check** — if a task has a ParentID, verify Task.BoardID == Parent.BoardID; if not, overwrite with the parent's BoardID.
-3. **Depth check** — verify no subtree exceeds depth 4 and no task exceeds 50 children.
+3. **Depth check** — if a subtree exceeds depth 4, sever bidirectionally: clear the task's ParentID to `""`, remove the task from its parent's ChildIDs, and reassign the task's BoardID to storageBoardId (promoting it to a root task).
+4. **Over-child check** — if a task has more than 50 children, collect it as a validation warning and block writes (cannot auto-repair without dropping relationships).
 
 ---
 
@@ -221,16 +247,16 @@ Mutations commit to the live database immediately. Separately, before each mutat
 
 - `todo undo` restores the most recent snapshot back into the live database (itself an atomic write) and pops it from the stack.
 - The stack-file mutation is also atomic, so a crash mid-undo cannot leave the journal and database disagreeing.
+- **Command classification** — read-only commands (e.g. `list`, `show`, `next`, `upcoming`, `tree`) take no snapshot and do not commit; journaled mutations (e.g. `add`, `update`, `complete`, `discard`) snapshot before writing and commit; `due-reminders` is a **non-journaled mutation** — it commits `Fired=true` to disk but takes no snapshot, so a fired reminder is intentionally not undoable. (A double-fire on a crash between computing which reminders to fire and writing `Fired=true` is accepted for a CLI tool.)
 
 ### 6.4 Process lock (concurrency control)
 
 To prevent two concurrent invocations from clobbering each other (last-writer-wins data loss), each process acquires an exclusive lock before reading:
 
 - Acquire `.todo/.lock` exclusively (`O_CREAT | O_EXCL`). On success, proceed and delete on exit.
-- If locked, retry briefly; if still locked after the timeout, fail with a system error exit code.
-- Stale-lock mitigation: the lock records PID + timestamp; a dead PID or an over-age lock is treated as stale and reclaimed.
-
-> **Pinned:** Exact lock timeout, retry cadence, and stale-lock thresholds are deferred to a follow-up design pass.
+- If locked, retry every **50 ms**; if still locked after **2 s**, fail with a system/lock error exit code (§10.1).
+- Stale-lock mitigation: the lock records PID + timestamp. Two independent reclamation signals — a **dead PID** (reclaim immediately) or a lock older than **30 s** (reclaim even if the PID appears live, as a backstop against PID recycling). Reclamation deletes the lock and re-acquires with `O_CREAT | O_EXCL` so two simultaneous reclaimers cannot both win.
+- A `ProcessChecker` seam (parallel to the `Clock`/`IdGenerator` seams) makes liveness checks unit-testable and cross-platform.
 
 ### 6.5 Configurable data directory (TODO_HOME)
 
@@ -269,7 +295,7 @@ The edit-distance threshold scales with title length rather than using a flat ca
 
 ## 9. Validation Rules
 
-All inputs are validated before mutation. Violations are rejected as input errors. (Exit-code numbers are provisional — see §10.)
+All inputs are validated before mutation. Violations are rejected as input/state errors (exit code 1 — see §10.1). Field rules are stateless; relational rules (uniqueness, preconditions, re-parent cycles) live in the services.
 
 | Field / Rule | Constraint |
 |---|---|
@@ -280,19 +306,25 @@ All inputs are validated before mutation. Violations are rejected as input error
 | Subtask depth | ≤ 4 levels. |
 | ChildIDs per task | ≤ 50. |
 | Board name | 1–100 chars; unique. |
-| DueDate | Must parse as ISO 8601; not in the past on manual entry. |
+| DueDate | Must parse as ISO 8601; not in the past on manual entry. When Duration is set, DueDate must carry a time component. |
+| Duration | Valid positive ISO 8601 duration; days/hours/minutes/seconds only — `P[n]Y` and `P[n]M` (months) are rejected with a "use days instead (e.g. P30D)" error. |
+| Reminder | OffsetOrTime is a valid ISO 8601 duration OR absolute datetime; computed fire time must be before DueDate and in the future at creation. |
+| Re-parent | (Relational, enforced in `TaskService`) the new parent is not the task itself, must exist, and must not be one of the task's descendants. Empty normalizes to root. |
 
 ---
 
 ## 10. CLI Specification
 
-### 10.1 Exit codes (provisional)
+### 10.1 Exit codes
 
-- `0` — Success.
-- `1` — Validation / input error.
-- `2` — System / file I/O error (includes lock-acquisition failure).
+| Code | Meaning | Triggers |
+|---|---|---|
+| `0` | Success | Normal completion; read-only commands succeed even on dirty data. |
+| `1` | Validation / input / state error | §9 field failure, state-machine violation, not-found, dirty-data blocks mutation. |
+| `2` | System / I/O / lock error | JSON parse failure, lock timeout, fsync/rename failure, backup I/O failure. |
+| `3` | User aborted | User answered `n` to a confirmation prompt (fuzzy-match confirm, confirm-discard). |
 
-> **Pinned:** Exit-code numbering is not final and may be expanded/renumbered during implementation.
+A future ImGui frontend needs to distinguish "command failed on bad input" (show an error) from "the user declined a confirmation" (do nothing) — hence the dedicated `3`. User-abort is signalled at the CLI/Formatter layer, not via the Error type.
 
 ### 10.2 I/O streams
 
@@ -316,11 +348,19 @@ todo board list [--sort name|created|tasks] [--reverse]
 
 ```
 todo add <"Title"> [-d "Text"] [-b BoardID] [-p ParentID]
-           [--due YYYY-MM-DD] [-r Rule] [-t "tags"] [-P 0-10]
-todo list [--all] [-b BoardID] [-s Status] [--archived]
+           [--due YYYY-MM-DD] [--duration <ISO duration>] [--reminder <offset|datetime>]
+           [-r Rule] [-t "tags"] [-P 0-10]
+todo list [--all] [-b BoardID] [-s Status] [--tag <tag>]
+           [--archived] [--show-done] [--show-cancelled]
            [--sort due|priority|created|title|status] [--reverse]
+todo show <ID>
+todo tree [ID]
+todo next
+todo upcoming [--n <count>] [--within <ISO duration>]
+todo due-reminders
 todo update <ID> [--title "New"] [--desc "New"] [-s Status]
-           [-t "newtag"] [-P 0-10]
+           [--due <YYYY-MM-DD>] [--duration <ISO duration>] [--reminder <offset|datetime>]
+           [--parent <ID|"">] [-t "newtag"] [-P 0-10]
 todo complete <ID>
 todo reopen <ID>
 todo cancel <ID>
@@ -330,33 +370,66 @@ todo discard <ID>
 todo undo
 ```
 
+**Read & reminder commands:** `todo next` prints the first task by due date (tasks with no due date are ineligible; if none qualify, a warning goes to stderr and the command exits 0). `todo upcoming` shows the next N due/event tasks within a window (defaults `upcomingCount=5` / `upcomingWindow="P3D"` from settings — §11.2; `--n` / `--within` override per-invocation). `todo show <ID>` is a detailed single-task view; `todo tree [ID]` is an ASCII subtask hierarchy walk (with a cycle guard against corrupted data). `todo due-reminders` is a non-journaled mutation (§6.3) that an external scheduler polls — it surfaces reminders whose fire time has passed and Fired is false, then marks them fired.
+
 ### 10.6 Sorting
 
 Sorting is a display concern applied only to listing commands (`todo list`, `todo board list`); it never changes stored order. `--sort` selects the key and `--reverse` flips the result. The default task sort is by due date with overdue items first. Priority sort orders P0 (emergency) first through P10 (non-issue).
 
-> **Pinned:** Making the default sort user-configurable belongs to the settings system (§11).
+> The default sort key is user-configurable via the `defaultSort` setting (§11.2); `--sort` overrides it per-invocation.
+
+### 10.7 Configuration commands
+
+```
+todo config get <key>
+todo config set <key> <value>
+todo config list
+```
+
+Settings live in `userdata.json` as a typed `UserData` struct (§11.2) plus an `extra` map for UI-owned preferences the CLI passes through untouched. Known keys are validated against the typed fields; unknown keys go into `extra`. The `showArchived` / `showDone` / `showCancelled` settings are the defaults for the matching `todo list` flags, and `upcomingCount` / `upcomingWindow` are the defaults for `todo upcoming`.
 
 ---
 
-## 11. Deferred Sections (TBD)
+## 11. Resolved Design Decisions
 
-The following are intentionally left open and will be designed collaboratively in follow-up passes:
+The sections formerly marked TBD were designed collaboratively and are now locked (2026-07-25/26).
 
-### 11.1 Class & function design — TBD
+### 11.1 Class & function design — resolved
 
-The object model (classes, responsibilities, key members, method signatures, and how components interact) will be specified after comparing design approaches. **This is the primary next deliverable.**
+The full object model — five layers (Domain → Core seams → Repository → Services → CLI), entities, error handling (`std::expected<T, Error>`), the validation/recurrence/duration namespaces, param structs, the `Resolver`, `TaskService` / `BoardService`, and the `Application` lifecycle — is specified in `PowerTree_Class_Design.md`, with code signatures in `PowerTree_Sketches.h`. Toolchain: CMake + vcpkg manifest mode, GCC 13.4 / MinGW-w64, **C++23** (`CMAKE_CXX_STANDARD 23`, `REQUIRED ON`, `EXTENSIONS OFF`); libraries nlohmann-json, cli11, fmt/std::format.
 
-### 11.2 Settings / configuration system — TBD
+### 11.2 Settings / configuration system — resolved
 
-How user preferences (default sort, theme, default board, etc.) are stored in `userdata.json` and surfaced/edited via the CLI.
+User preferences are stored in `userdata.json` as a typed `UserData` struct (edited via `todo config` — §10.7):
 
-### 11.3 Lock-file mechanics — TBD
+| Field | Default | Purpose |
+|---|---|---|
+| `activeBoardId` | — | Board new tasks land on when `-b` is not given (set via `todo board switch`). |
+| `storageBoardId` | — | Safety-net destination for §5.4 integrity repair; not a normal workflow destination. |
+| `defaultSort` | `"due"` | Default `todo list` sort key. |
+| `defaultPriority` | `5` | Priority applied when `-P` is not given. |
+| `defaultRecurrenceInterval` | `1` | Default recurrence interval. |
+| `theme` | `"default"` | UI theme (future frontend). |
+| `dateFormat` | `"YYYY-MM-DD"` | Date display format. |
+| `confirmDiscard` | `true` | Whether `discard` prompts for confirmation. |
+| `showArchived` | `false` | Default for `todo list --archived`. |
+| `showDone` | `false` | Default for `todo list --show-done`. |
+| `showCancelled` | `false` | Default for `todo list --show-cancelled`. |
+| `upcomingCount` | `5` | Default N for `todo upcoming`. |
+| `upcomingWindow` | `"P3D"` | Default window for `todo upcoming`. |
+| `extra` | — | UI-owned preferences; CLI passes through untouched. |
 
-Exact timeout, retry cadence, and stale-lock reclamation thresholds for §6.4.
+### 11.3 Lock-file mechanics — resolved
 
-### 11.4 Exit-code finalization — TBD
+See §6.4 for the concrete parameters: 50 ms retry cadence, 2 s acquire timeout, 30 s stale-age cap, dead-PID immediate reclaim, and the `ProcessChecker` seam.
 
-Final numbering and any additional codes for §10.1.
+### 11.4 Exit-code finalization — resolved
+
+See §10.1 for the finalized scheme (0 success, 1 validation/input/state, 2 system/I/O/lock, 3 user aborted).
+
+### 11.5 Nice-to-have features — locked
+
+The following were designed and locked during review and are reflected in the sections above: event-like tasks via `Duration` (§3.1, §3.4) with a hand-rolled ISO 8601 duration parser (no new dependency); `Reminders` and `todo due-reminders` (§3.4, §6.3, §10.5) with recalculation-on-due-edit (§4.8); `todo next` / `todo upcoming` / `todo show` / `todo tree` / `todo list --tag` (§10.5); re-parenting via `update --parent` (§4.7); and relative date input (`tomorrow`, `+3d`, `+2w`) expanded to ISO 8601 in the CLI layer.
 
 ---
 
@@ -375,4 +448,4 @@ Dependencies are managed with Microsoft vcpkg in manifest mode. A `vcpkg.json` a
 ### 12.2 Notes
 
 - Commits the project to a CMake + `vcpkg.json` setup.
-- `fmt` may be dropped in favour of `std::format` if a C++20 toolchain is guaranteed, reducing one dependency.
+- Toolchain locked at **C++23** (GCC 13.4 / MinGW-w64), so `std::format` is available; `fmt` is optional and may be dropped in favour of `std::format` to remove one dependency.
